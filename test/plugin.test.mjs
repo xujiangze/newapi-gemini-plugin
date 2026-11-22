@@ -346,6 +346,221 @@ test("a mapped Omni alias sends the upstream model name", () => {
   assert.equal(buildSubmitRequest(driverCtx(intent, { model: "video", upstreamModel: "gemini-omni-1.2-flash" })).body.model, "gemini-omni-1.2-flash");
 });
 
+const LRO_BASE = "https://backend.example.invalid";
+const LRO_NAME = "models/gemini-omni-1.2-flash/operations/op_abc";
+const LRO_CONFIG = { video_api: "predict_long_running", video_api_key_location: "query" };
+const LRO_DONE = {
+  name: LRO_NAME,
+  done: true,
+  response: { generateVideoResponse: { generatedSamples: [{ video: { uri: LRO_BASE + "/v1beta/files/video:download?alt=media" } }] } },
+};
+
+function lroCtx(value, extra) {
+  return driverCtx(videoIntent(Object.assign({ prompt: "A drone flying over a forest at sunrise", seconds: 8, resolution: "360p" }, value)), {
+    baseUrl: LRO_BASE,
+    config: LRO_CONFIG,
+    ...extra,
+  });
+}
+
+function lroContent(data, extra) {
+  return {
+    taskId: "task_public",
+    upstreamTaskId: "lro_" + utils.base64URL(LRO_NAME),
+    status: "SUCCESS",
+    action: "text_to_video",
+    data: data,
+    baseUrl: LRO_BASE,
+    apiKey: "test/key+with &=symbols",
+    upstream: { kind: "vendor" },
+    config: LRO_CONFIG,
+    clientRequest: { method: "GET", headers: {} },
+    artifactKey: "video",
+    ...extra,
+  };
+}
+
+test("video channel config defaults to Interactions and offers LRO query authentication", () => {
+  assert.equal(meta.channelConfig.type, "object");
+  const properties = meta.channelConfig.properties;
+  assert.equal(properties.video_api.default, "interactions");
+  assert.deepEqual(properties.video_api.enum, ["interactions", "predict_long_running"]);
+  assert.equal(properties.video_api_key_location.default, "header");
+  assert.deepEqual(properties.video_api_key_location.enum, ["header", "query"]);
+});
+
+test("a predictLongRunning video runs submit, poll, settlement and URI download", () => {
+  const ctx = deepFreeze(lroCtx({}, { apiKey: "test/key+with &=symbols", baseUrl: LRO_BASE + "/" }));
+  const request = buildSubmitRequest(ctx);
+  assert.equal(request.url, LRO_BASE + "/v1beta/models/gemini-omni-1.2-flash:predictLongRunning?key=test%2Fkey%2Bwith%20%26%3Dsymbols");
+  assert.equal(request.method, "POST");
+  assert.deepEqual(request.headers, { "Content-Type": "application/json", Accept: "application/json" });
+  assert.deepEqual(request.body, {
+    instances: [{ prompt: ctx.requestBody.prompt }],
+    parameters: { personGeneration: "dont_allow", aspectRatio: "16:9", sampleCount: 1, durationSeconds: 8, resolution: "360p" },
+  });
+  assert.equal(request.action, "text_to_video");
+  assert.deepEqual(extractUsage(ctx), { input_tokens: 0, output_tokens: 0, video_tokens: 15448 });
+  const submitted = { name: LRO_NAME };
+  const parsed = parseSubmitResponse(ctx, deepFreeze({ statusCode: 200, body: submitted }));
+  assert.equal(parsed.taskId, "lro_" + utils.base64URL(LRO_NAME));
+  assert.ok(!parsed.taskId.includes("/"));
+  assert.deepEqual(parsed.taskData, submitted);
+  assert.equal(parsed.state.video_api, "predict_long_running");
+  assert.equal(parsed.state.video_api_key_location, "query");
+  assert.equal(parsed.immediate, undefined);
+  const query = { ...ctx, taskId: parsed.taskId, data: submitted, state: parsed.state };
+  assert.deepEqual(buildQueryRequest(deepFreeze(query)), {
+    url: LRO_BASE + "/v1beta/" + LRO_NAME + "?key=test%2Fkey%2Bwith%20%26%3Dsymbols",
+    method: "GET",
+    headers: { Accept: "application/json" },
+  });
+  assert.deepEqual(parseTaskResult(query, submitted), { status: "IN_PROGRESS", progress: "50%" });
+  assert.deepEqual(parseTaskResult(query, deepFreeze(structuredClone(LRO_DONE))), { status: "SUCCESS", progress: "100%" });
+  assert.equal(extractUsageOnComplete(query, {}, LRO_DONE), null);
+  assert.deepEqual(listArtifacts({ status: "SUCCESS", data: LRO_DONE }), [{ key: "video", type: "video", mimeType: "video/mp4" }]);
+  assert.deepEqual(buildContentRequest(deepFreeze(lroContent(LRO_DONE, { state: parsed.state }))), {
+    url: LRO_DONE.response.generateVideoResponse.generatedSamples[0].video.uri + "&key=test%2Fkey%2Bwith%20%26%3Dsymbols",
+    method: "GET",
+    headers: {},
+  });
+});
+
+test("LRO uses mapped models, request defaults and header authentication when selected", () => {
+  const config = { video_api: "predict_long_running", video_api_key_location: "header" };
+  const ctx = lroCtx({ seconds: undefined, resolution: undefined, size: "1080x1920" }, { model: "video", upstreamModel: "gemini-omni-1.2-flash", config });
+  const request = buildSubmitRequest(ctx);
+  assert.equal(request.url, LRO_BASE + "/v1beta/models/gemini-omni-1.2-flash:predictLongRunning");
+  assert.equal(request.body.parameters.durationSeconds, 8);
+  assert.equal(request.body.parameters.resolution, "1080p");
+  assert.equal(request.body.parameters.aspectRatio, "9:16");
+  assert.equal(request.headers["x-goog-api-key"], "AIza-test");
+  assert.equal(request.headers.Authorization, undefined);
+  const parsed = parseSubmitResponse(ctx, { body: { name: LRO_NAME } });
+  const query = buildQueryRequest({ ...ctx, taskId: parsed.taskId, state: parsed.state });
+  assert.equal(query.headers["x-goog-api-key"], "AIza-test");
+  assert.equal(query.url, LRO_BASE + "/v1beta/" + LRO_NAME);
+  const content = buildContentRequest(lroContent(LRO_DONE, { config, state: parsed.state, clientRequest: { method: "HEAD", headers: {} } }));
+  assert.deepEqual(content, { url: LRO_DONE.response.generateVideoResponse.generatedSamples[0].video.uri, method: "HEAD", headers: { "x-goog-api-key": "test/key+with &=symbols" } });
+  const implicitHeader = buildSubmitRequest(lroCtx({}, { config: { video_api: "predict_long_running" }, upstream: undefined }));
+  assert.equal(implicitHeader.headers["x-goog-api-key"], "AIza-test");
+});
+
+test("operation states require a valid name and a usable video on completion", () => {
+  const ctx = lroCtx();
+  for (const body of [{ name: LRO_NAME }, { name: LRO_NAME, done: false }]) {
+    assert.deepEqual(parseTaskResult(ctx, deepFreeze(body)), { status: "IN_PROGRESS", progress: "50%" });
+  }
+  for (const body of [null, [], {}, { done: true }, { name: "https://evil.invalid/operations/abc", done: false }, { name: "../operations/abc" }, { name: LRO_NAME, done: "true" }]) {
+    assert.equal(parseTaskResult(ctx, body).status, "UNKNOWN");
+  }
+  assert.deepEqual(parseTaskResult(ctx, { name: LRO_NAME, done: true, error: { code: 400, message: "blocked" } }), { status: "FAILURE", progress: "100%", reason: "blocked" });
+  assert.equal(parseTaskResult(ctx, { name: LRO_NAME, done: true, error: { code: 13 } }).status, "FAILURE");
+  const noVideos = [undefined, {}, { generatedSamples: [] }, { generatedVideos: [{ video: { uri: LRO_BASE + "/video.mp4" } }] }, { generatedSamples: [{ video: { uri: "" } }] }];
+  for (const generateVideoResponse of noVideos) {
+    const body = { name: LRO_NAME, done: true, response: { generateVideoResponse } };
+    assert.equal(parseTaskResult(ctx, body).status, "FAILURE");
+    assert.deepEqual(listArtifacts({ status: "SUCCESS", data: body }), []);
+  }
+  assert.deepEqual(listArtifacts({ status: "FAILURE", data: LRO_DONE }), []);
+  assert.throws(() => buildContentRequest(lroContent(LRO_DONE, { artifactKey: "image" })), /artifact_not_found/);
+});
+
+test("invalid operation identifiers are rejected rather than interpolated into URLs", () => {
+  const ctx = lroCtx();
+  for (const name of [undefined, "", {}, "https://evil.invalid/operations/x", "/operations/x", "../operations/x", "models/../operations/x", "operations/x?key=bad", "operations/x#fragment", "operations/x%2fy", "operations/x\\y"]) {
+    assert.throws(() => parseSubmitResponse(ctx, { body: { name } }), /operation name/);
+    if (typeof name === "string" && name) {
+      assert.throws(() => buildQueryRequest({ ...ctx, taskId: "lro_" + utils.base64URL(name) }), /operation name/);
+    }
+  }
+  assert.throws(() => parseSubmitResponse(ctx, { body: { id: "interaction_test" } }), /operation name/);
+  assert.throws(() => parseSubmitResponse(ctx, { body: { error: { message: "rejected" } } }), /rejected/);
+  const shortName = "operations/abc-123";
+  const parsed = parseSubmitResponse(ctx, { body: { name: shortName } });
+  assert.equal(buildQueryRequest({ ...ctx, taskId: parsed.taskId }).url, LRO_BASE + "/v1beta/" + shortName + "?key=AIza-test");
+});
+
+test("already finished LRO submissions preserve success or failure", () => {
+  const ctx = lroCtx();
+  assert.deepEqual(parseSubmitResponse(ctx, { body: LRO_DONE }).immediate, { status: "SUCCESS", progress: "100%" });
+  assert.equal(parseSubmitResponse(ctx, { body: { name: LRO_NAME, done: true, error: { message: "filtered" } } }).immediate.status, "FAILURE");
+  assert.equal(parseSubmitResponse(ctx, { body: { name: LRO_NAME, done: true } }).immediate.status, "FAILURE");
+});
+
+test("URI downloads preserve queries, replace existing keys and never attach credentials cross-origin", () => {
+  const withURI = (uri) => ({ ...LRO_DONE, response: { generateVideoResponse: { generatedSamples: [{ video: { uri } }] } } });
+  const sameOrigin = [LRO_BASE + "/video.mp4", LRO_BASE + "/video.mp4?alt=media", LRO_BASE + "/video.mp4?alt=media&key=stale", LRO_BASE + "/video.mp4?%6Bey=stale&signature=a%2Fb%3D"];
+  for (const uri of sameOrigin) {
+    const content = buildContentRequest(lroContent(withURI(uri)));
+    const url = new URL(content.url);
+    assert.deepEqual(url.searchParams.getAll("key"), ["test/key+with &=symbols"]);
+    if (uri.includes("alt=media")) assert.equal(url.searchParams.get("alt"), "media");
+    if (uri.includes("signature=")) assert.ok(content.url.includes("signature=a%2Fb%3D"));
+    assert.equal(content.contentPath, undefined);
+    assert.equal(content.credentialless, undefined);
+    assert.equal(content.headers.Authorization, undefined);
+  }
+  const upper = buildContentRequest(lroContent(withURI("https://BACKEND.example.invalid:443/video.mp4")));
+  assert.equal(new URL(upper.url).searchParams.get("key"), "test/key+with &=symbols");
+  for (const uri of ["https://cdn.example.invalid/video.mp4?sig=a%2Fb", "https://backend.example.invalid.evil.invalid/video.mp4", "https://backend.example.invalid:8443/video.mp4"]) {
+    const content = buildContentRequest(lroContent(withURI(uri)));
+    assert.deepEqual(content, { url: uri, method: "GET", credentialless: true });
+    assert.ok(!JSON.stringify(content).includes("test/key"));
+  }
+  for (const uri of ["/relative.mp4", "file:///tmp/x", "gs://bucket/x", "http://backend.example.invalid/x", "https://user:pass@backend.example.invalid/x", "https://backend.example.invalid/x#fragment", "https://backend.example.invalid\\@evil.invalid/x", "https://backend.example.invalid/x\n"]) {
+    const data = withURI(uri);
+    assert.equal(parseTaskResult({}, data).status, "FAILURE", uri);
+    assert.throws(() => buildContentRequest(lroContent(data)), /artifact_not_found/, uri);
+  }
+});
+
+test("task protocol and LRO authentication survive later channel setting changes", () => {
+  const submitted = parseSubmitResponse(lroCtx(), { body: { name: LRO_NAME } });
+  const query = buildQueryRequest({ ...lroCtx(), config: { video_api: "interactions", video_api_key_location: "header" }, taskId: submitted.taskId, state: submitted.state, data: { name: LRO_NAME } });
+  assert.equal(query.url, LRO_BASE + "/v1beta/" + LRO_NAME + "?key=AIza-test");
+  assert.equal(query.headers["x-goog-api-key"], undefined);
+  const content = buildContentRequest(lroContent(LRO_DONE, { config: {}, state: submitted.state }));
+  assert.ok(content.url.endsWith("&key=test%2Fkey%2Bwith%20%26%3Dsymbols"));
+  const legacyQuery = buildQueryRequest({ ...lroCtx(), taskId: "v1_abc", data: { id: "v1_abc", object: "interaction", status: "in_progress" } });
+  assert.equal(legacyQuery.url, LRO_BASE + "/v1beta/interactions/v1_abc");
+  assert.equal(legacyQuery.headers["x-goog-api-key"], "AIza-test");
+  assert.equal(buildQueryRequest({ ...lroCtx(), taskId: "v1_abc" }).url, LRO_BASE + "/v1beta/interactions/v1_abc");
+  assert.equal(parseTaskResult({ ...lroCtx(), taskId: "v1_abc", data: { id: "v1_abc", object: "interaction" } }, { id: "v1_abc", status: "in_progress" }).status, "IN_PROGRESS");
+  assert.equal(parseTaskResult({ ...lroCtx(), taskId: "v1_abc" }, { status: "in_progress" }).status, "IN_PROGRESS");
+  const snapshot = structuredClone(DONE);
+  delete snapshot.steps[2].content[0].data;
+  assert.deepEqual(listArtifacts({ status: "SUCCESS", data: snapshot }), [{ key: "video", type: "video", mimeType: "video/mp4" }]);
+  const legacyContent = buildContentRequest(lroContent(snapshot, { upstreamTaskId: "v1_abc" }));
+  assert.equal(legacyContent.url, LRO_BASE + "/v1beta/interactions/v1_abc");
+  assert.equal(legacyContent.headers["x-goog-api-key"], "test/key+with &=symbols");
+  assert.deepEqual(legacyContent.contentPath, ["steps", 2, "content", 0, "data"]);
+});
+
+test("LRO is text-only, refuses gateway chaining and leaves Decisions unchanged", () => {
+  assert.throws(() => buildSubmitRequest(lroCtx({ input_reference: "data:image/png;base64,iVBORw0KGgoAAAA" })), /predictLongRunning.*text-to-video/);
+  assert.throws(() => extractUsage(lroCtx({ input_reference: "data:image/png;base64,iVBORw0KGgoAAAA" })), /predictLongRunning.*text-to-video/);
+  assert.throws(() => buildSubmitRequest(lroCtx({ prompt: "" })), /prompt is required/);
+  assert.throws(() => buildSubmitRequest(lroCtx({}, { upstream: { kind: "new_api" } })), /not available through a New API gateway/);
+  const decision = driverCtx(decode(QUICKSTART), { baseUrl: LRO_BASE, config: LRO_CONFIG });
+  assert.equal(buildSubmitRequest(decision).url, LRO_BASE + "/v1beta/decisions");
+  assert.equal(buildSubmitRequest(decision).headers["x-goog-api-key"], "AIza-test");
+  assert.deepEqual(parseSubmitResponse(decision, { body: REPLY }).immediate, { status: "SUCCESS", progress: "100%" });
+});
+
+test("Responses also uses the configured LRO upstream and only renders gateway artifact URLs", () => {
+  const intent = protocols.openai_responses.decodeRequest({ body: { kind: "json", value: { model: OMNI[0], input: "A drone", seconds: 8, resolution: "360p" } } });
+  const request = buildSubmitRequest(driverCtx(intent, { baseUrl: LRO_BASE, config: LRO_CONFIG }));
+  assert.deepEqual(request.body.instances, [{ prompt: "A drone" }]);
+  assert.equal(request.body.parameters.durationSeconds, 8);
+  const ctx = { artifacts: { video: { url: "https://gateway.example.invalid/video?access=signed&x=1" } } };
+  const first = protocols.openai_responses.renderEvents(ctx, { status: "SUCCESS", progress: "100%" });
+  assert.equal(first.done, true);
+  assert.equal(first.events.length, 1);
+  assert.ok(first.events[0].data.includes("gateway.example.invalid"));
+  assert.equal(protocols.openai_responses.renderEvents(ctx, { status: "SUCCESS", progress: "100%" }, first.state).events.length, 0);
+  assert.ok(!JSON.stringify(protocols.openai_responses.renderFinal(ctx, {})).includes(LRO_BASE));
+});
 
 test("code never references meta, so the gateway can read it statically", async () => {
   const { readFileSync } = await import("node:fs");

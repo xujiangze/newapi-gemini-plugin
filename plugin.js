@@ -14,6 +14,26 @@ export const meta = {
   models: ["gemini-omni-1.2-flash", "gemini-omni-1.1-flash", "gemini-decision-1"],
   fetchMode: "per_task",
   upstreams: ["vendor", "new_api"],
+  channelConfig: {
+    type: "object",
+    properties: {
+      video_api: {
+        type: "string",
+        title: { en: "Video upstream API", zh: "视频上游协议" },
+        enum: ["interactions", "predict_long_running"],
+        enumTitles: [{ en: "Interactions", zh: "Interactions" }, { en: "predictLongRunning (text-to-video)", zh: "predictLongRunning（文生视频）" }],
+        default: "interactions",
+      },
+      video_api_key_location: {
+        type: "string",
+        title: { en: "Long-running API key location", zh: "长任务 API Key 位置" },
+        enum: ["header", "query"],
+        enumTitles: [{ en: "x-goog-api-key header", zh: "x-goog-api-key 请求头" }, { en: "?key= query parameter", zh: "?key= 查询参数" }],
+        default: "header",
+        visibleWhen: { video_api: ["predict_long_running"] },
+      },
+    },
+  },
   // Gemini Omni bills tokens: input, text output (including thinking) and
   // video output (with audio). Video tokens are reserved from the requested
   // duration and resolution; completion settles all three on reported usage.
@@ -282,31 +302,142 @@ function decisionResult(ctx, resp) {
 }
 
 // Gemini Omni Flash video generation: https://aistudio.google.com/docs/omni
-// Requests run as background interactions of the Interactions API and are
-// polled; a finished interaction holds the video inline as base64. Video
-// output is billed at these tokens per second of video
-// (https://aistudio.google.com/docs/pricing#gemini-omni-1.2-flash).
+// Interactions return inline video; compatible backends can instead use
+// predictLongRunning operations with a video URI. Video output is reserved at
+// these tokens per second (https://aistudio.google.com/docs/pricing#gemini-omni-1.2-flash).
 const OMNI_VIDEO_TOKENS_PER_SECOND = { "360p": 1931, "720p": 5792, "1080p": 8688, "4k": 17376 };
 const OMNI_RESOLUTIONS = Object.keys(OMNI_VIDEO_TOKENS_PER_SECOND);
 const OMNI_IMAGE_TYPES = ["image/jpeg", "image/png"];
 const MAX_OMNI_IMAGES = 6;
 const DEFAULT_OMNI_SECONDS = 8;
 const DEFAULT_API_ROOT = "https://generativelanguage.googleapis.com";
+const OPERATION_ID_PREFIX = "lro_";
 
 function omniModel(ctx) {
   return trimmed(ctx.upstreamModel || ctx.model).startsWith("gemini-omni-");
 }
 
-function interactionsURL(ctx, interactionId) {
-  // The upstream gateway has no Interactions route for this plugin.
+function videoAPI(ctx) {
+  const config = plainObject(ctx.config) || {};
+  const value = config.video_api || "interactions";
+  if (value !== "interactions" && value !== "predict_long_running") throw new Error("unsupported video upstream API");
+  return value;
+}
+
+function videoKeyLocation(ctx) {
+  const state = plainObject(ctx.state) || {};
+  const config = plainObject(ctx.config) || {};
+  const value = state.video_api_key_location || config.video_api_key_location || "header";
+  if (value !== "header" && value !== "query") throw new Error("unsupported video API key location");
+  return value;
+}
+
+function videoBase(ctx) {
   if (viaGateway(ctx)) throw new Error("Gemini Omni is not available through a New API gateway");
-  const base = trimmed(ctx.baseUrl).replace(/\/+$/, "") || DEFAULT_API_ROOT;
-  const url = base + "/v1beta/interactions";
+  return trimmed(ctx.baseUrl).replace(/\/+$/, "") || DEFAULT_API_ROOT;
+}
+
+function interactionsURL(ctx, interactionId) {
+  const url = videoBase(ctx) + "/v1beta/interactions";
   return interactionId ? url + "/" + encodeURIComponent(interactionId) : url;
 }
 
 function omniHeaders(ctx) {
   return Object.assign({ "Content-Type": "application/json", Accept: "application/json" }, authHeaders(ctx));
+}
+
+function withQueryKey(url, key) {
+  const question = url.indexOf("?");
+  const base = question < 0 ? url : url.slice(0, question);
+  const params = question < 0 ? [] : url.slice(question + 1).split("&").filter(function (param) {
+    if (!param) return false;
+    try {
+      return decodeURIComponent(param.split("=")[0].replace(/\+/g, " ")) !== "key";
+    } catch {
+      return true;
+    }
+  });
+  params.push("key=" + encodeURIComponent(String(key || "")));
+  return base + "?" + params.join("&");
+}
+
+function operationRequest(ctx, request) {
+  if (videoKeyLocation(ctx) === "query") return Object.assign({}, request, { url: withQueryKey(request.url, ctx.apiKey) });
+  return Object.assign({}, request, { headers: Object.assign({}, request.headers || {}, authHeaders(ctx)) });
+}
+
+function operationName(value) {
+  if (typeof value !== "string") return "";
+  return /^(?:models\/[A-Za-z0-9_-][A-Za-z0-9._-]*\/)?operations\/[A-Za-z0-9_-][A-Za-z0-9._-]*$/.test(value) ? value : "";
+}
+
+function isOperation(body) {
+  return plainObject(body) !== null && Boolean(operationName(body.name));
+}
+
+// Stored task data and the marked ID win over later channel config changes.
+// Unmarked IDs without data belong to the original Interactions driver.
+function operationTask(ctx) {
+  if (isInteraction(ctx.data)) return false;
+  const state = plainObject(ctx.state) || {};
+  if (state.video_api) return state.video_api === "predict_long_running";
+  return isOperation(ctx.data) || trimmed(ctx.taskId).startsWith(OPERATION_ID_PREFIX);
+}
+
+// The sandbox has no browser URL API. Accept only absolute HTTPS media URLs
+// without userinfo, fragments or ambiguous separators; the host checks SSRF.
+function httpsOrigin(value) {
+  if (typeof value !== "string" || /[\s\u0000-\u0020\u007f\\#]/.test(value)) return "";
+  const match = /^https:\/\/([a-z0-9.-]+|\[[a-f0-9:.]+\])(?::([0-9]{1,5}))?(?=\/|\?|$)/i.exec(value);
+  if (!match) return "";
+  const port = match[2] ? Number(match[2]) : 443;
+  if (port < 1 || port > 65535) return "";
+  return "https://" + match[1].toLowerCase() + (port === 443 ? "" : ":" + port);
+}
+
+function operationVideo(body) {
+  if (!isOperation(body) || body.done !== true || body.error !== undefined && body.error !== null) return null;
+  const response = plainObject(body.response) || {};
+  const generated = plainObject(response.generateVideoResponse) || {};
+  const samples = Array.isArray(generated.generatedSamples) ? generated.generatedSamples : [];
+  const sample = plainObject(samples[0]) || {};
+  const video = plainObject(sample.video) || {};
+  return httpsOrigin(video.uri) ? { uri: video.uri, mimeType: "video/mp4" } : null;
+}
+
+function operationError(body) {
+  const error = plainObject(body.error) || {};
+  return trimmed(error.message) || trimmed(error.code) || "operation failed";
+}
+
+function operationTaskResult(body) {
+  body = plainObject(body) || {};
+  if (body.error !== undefined && body.error !== null) return { status: "FAILURE", progress: "100%", reason: operationError(body) };
+  if (!isOperation(body) || body.done !== undefined && typeof body.done !== "boolean") return { status: "UNKNOWN", reason: "unrecognized operation state" };
+  if (body.done !== true) return { status: "IN_PROGRESS", progress: "50%" };
+  if (!operationVideo(body)) return { status: "FAILURE", progress: "100%", reason: "operation completed without a video URI" };
+  return { status: "SUCCESS", progress: "100%" };
+}
+
+function operationInput(req) {
+  if (omniImages(req).length) throw new Error("predictLongRunning currently supports text-to-video only");
+  if (!trimmed(req.prompt)) throw new Error("prompt is required");
+  return { prompt: req.prompt };
+}
+
+function operationSubmitRequest(ctx) {
+  const req = ctx.requestBody || {};
+  const instance = operationInput(req);
+  return operationRequest(ctx, {
+    url: videoBase(ctx) + "/v1beta/models/" + encodeURIComponent(ctx.upstreamModel || ctx.model) + ":predictLongRunning",
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: {
+      instances: [instance],
+      parameters: { personGeneration: "dont_allow", aspectRatio: aspect(req.size), sampleCount: 1, durationSeconds: omniDuration(ctx, req), resolution: omniResolution(req) },
+    },
+    action: "text_to_video",
+  });
 }
 
 function sizeParts(size) {
@@ -417,6 +548,7 @@ function omniSubmitRequest(ctx) {
 
 function omniUsage(ctx) {
   const req = ctx.requestBody || {};
+  if (videoAPI(ctx) === "predict_long_running") operationInput(req);
   // Input and text output are only known on completion, which reports them.
   return { input_tokens: 0, output_tokens: 0, video_tokens: omniDuration(ctx, req) * OMNI_VIDEO_TOKENS_PER_SECOND[omniResolution(req)] };
 }
@@ -559,12 +691,25 @@ export const native = {
 export function buildSubmitRequest(ctx) {
   if (isDecision(ctx)) return decisionRequest(ctx);
   if (!omniModel(ctx)) throw new Error("unsupported model; use gemini-omni-1.2-flash, gemini-omni-1.1-flash or gemini-decision-1");
-  return omniSubmitRequest(ctx);
+  return videoAPI(ctx) === "predict_long_running" ? operationSubmitRequest(ctx) : omniSubmitRequest(ctx);
 }
 
 export function parseSubmitResponse(ctx, resp) {
   if (isDecision(ctx)) return decisionResult(ctx, resp);
   const body = plainObject(resp.body) || {};
+  if (videoAPI(ctx) === "predict_long_running") {
+    if (!isOperation(body)) {
+      if (body.error !== undefined && body.error !== null) throw new Error(operationError(body));
+      throw new Error("Gemini Omni response is missing a valid operation name");
+    }
+    const parsed = {
+      taskId: OPERATION_ID_PREFIX + utils.base64URL(body.name),
+      taskData: body,
+      state: { video_api: "predict_long_running", video_api_key_location: videoKeyLocation(ctx) },
+    };
+    if (body.done === true || body.error !== undefined && body.error !== null) parsed.immediate = operationTaskResult(body);
+    return parsed;
+  }
   const id = trimmed(body.id);
   if (!id) throw new Error("Gemini Omni response is missing the interaction id");
   return { taskId: id, taskData: body };
@@ -593,21 +738,44 @@ export function extractUsageOnComplete(task, result, data) {
 }
 
 export function buildQueryRequest(ctx) {
+  if (operationTask(ctx)) {
+    const taskId = trimmed(ctx.taskId);
+    let name = "";
+    if (taskId.startsWith(OPERATION_ID_PREFIX)) {
+      try {
+        name = operationName(utils.base64URLDecode(taskId.slice(OPERATION_ID_PREFIX.length)));
+      } catch {
+        throw new Error("invalid operation name");
+      }
+    } else name = operationName((plainObject(ctx.data) || {}).name);
+    if (!name) throw new Error("invalid operation name");
+    return operationRequest(ctx, { url: videoBase(ctx) + "/v1beta/" + name, method: "GET", headers: { Accept: "application/json" } });
+  }
   return { url: interactionsURL(ctx, ctx.taskId), method: "GET", headers: Object.assign({ Accept: "application/json" }, authHeaders(ctx)) };
 }
 
 export function parseTaskResult(ctx, body) {
-  return omniTaskResult(body);
+  if (isInteraction(body)) return omniTaskResult(body);
+  if (isOperation(body) || operationTask(ctx)) return operationTaskResult(body);
+  if (isInteraction(ctx.data) || trimmed(ctx.taskId)) return omniTaskResult(body);
+  return videoAPI(ctx) === "predict_long_running" ? operationTaskResult(body) : omniTaskResult(body);
 }
 
 export function listArtifacts(task) {
-  if (task.status !== "SUCCESS" || !isInteraction(task.data)) return [];
-  const video = omniVideo(task.data);
+  if (task.status !== "SUCCESS") return [];
+  const video = isInteraction(task.data) ? omniVideo(task.data) : operationVideo(task.data);
   return video ? [{ key: "video", type: "video", mimeType: video.mimeType }] : [];
 }
 
 export function buildContentRequest(ctx) {
-  if (ctx.artifactKey !== "video" || !isInteraction(ctx.data)) throw new Error("artifact_not_found");
+  if (ctx.artifactKey !== "video") throw new Error("artifact_not_found");
+  if (!isInteraction(ctx.data)) {
+    const video = operationVideo(ctx.data);
+    if (!video) throw new Error("artifact_not_found");
+    const method = ctx.clientRequest && ctx.clientRequest.method === "HEAD" ? "HEAD" : "GET";
+    if (httpsOrigin(video.uri) !== httpsOrigin(videoBase(ctx))) return { url: video.uri, method: method, credentialless: true };
+    return operationRequest(ctx, { url: video.uri, method: method, headers: {} });
+  }
   const video = omniVideo(ctx.data);
   if (!video) throw new Error("artifact_not_found");
   return {

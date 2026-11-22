@@ -544,6 +544,180 @@
         ],
         "mimeType": "video/mp4"
       }
+    },
+    {
+      "name": "omni submits predictLongRunning with query authentication",
+      "hook": "buildSubmitRequest",
+      "args": [
+        {
+          "requestBody": {
+            "prompt": "A drone flying over a forest at sunrise",
+            "duration": 8,
+            "resolution": "360p",
+            "size": "1280x720"
+          },
+          "model": "video",
+          "upstreamModel": "gemini-omni-1.2-flash",
+          "baseUrl": "https://backend.example.invalid/",
+          "apiKey": "test-key",
+          "upstream": { "kind": "vendor" },
+          "config": { "video_api": "predict_long_running", "video_api_key_location": "query" }
+        }
+      ],
+      "expected": {
+        "url": "https://backend.example.invalid/v1beta/models/gemini-omni-1.2-flash:predictLongRunning?key=test-key",
+        "method": "POST",
+        "headers": { "Content-Type": "application/json", "Accept": "application/json" },
+        "body": {
+          "instances": [{ "prompt": "A drone flying over a forest at sunrise" }],
+          "parameters": {
+            "personGeneration": "dont_allow",
+            "aspectRatio": "16:9",
+            "sampleCount": 1,
+            "durationSeconds": 8,
+            "resolution": "360p"
+          }
+        },
+        "action": "text_to_video"
+      }
+    },
+    {
+      "name": "omni keeps the operation name in a path-safe task ID and pins its auth",
+      "hook": "parseSubmitResponse",
+      "args": [
+        { "config": { "video_api": "predict_long_running", "video_api_key_location": "query" } },
+        { "statusCode": 200, "body": { "name": "models/gemini-omni-1.2-flash/operations/op_abc" } }
+      ],
+      "expected": {
+        "taskId": "lro_bW9kZWxzL2dlbWluaS1vbW5pLTEuMi1mbGFzaC9vcGVyYXRpb25zL29wX2FiYw",
+        "taskData": { "name": "models/gemini-omni-1.2-flash/operations/op_abc" },
+        "state": { "video_api": "predict_long_running", "video_api_key_location": "query" }
+      }
+    },
+    {
+      "name": "omni polls the operation path after a channel setting change",
+      "hook": "buildQueryRequest",
+      "args": [
+        {
+          "taskId": "lro_bW9kZWxzL2dlbWluaS1vbW5pLTEuMi1mbGFzaC9vcGVyYXRpb25zL29wX2FiYw",
+          "baseUrl": "https://backend.example.invalid",
+          "apiKey": "test-key",
+          "config": { "video_api": "interactions", "video_api_key_location": "header" },
+          "state": { "video_api": "predict_long_running", "video_api_key_location": "query" }
+        }
+      ],
+      "expected": {
+        "url": "https://backend.example.invalid/v1beta/models/gemini-omni-1.2-flash/operations/op_abc?key=test-key",
+        "method": "GET",
+        "headers": { "Accept": "application/json" }
+      }
+    },
+    {
+      "name": "omni operation without done is in progress",
+      "hook": "parseTaskResult",
+      "args": [{}, { "name": "operations/op_abc" }],
+      "expected": { "status": "IN_PROGRESS", "progress": "50%" }
+    },
+    {
+      "name": "omni completed operation with generatedSamples succeeds",
+      "hook": "parseTaskResult",
+      "args": [
+        {},
+        {
+          "name": "operations/op_abc",
+          "done": true,
+          "response": {
+            "generateVideoResponse": {
+              "generatedSamples": [{ "video": { "uri": "https://backend.example.invalid/video.mp4?alt=media" } }]
+            }
+          }
+        }
+      ],
+      "expected": { "status": "SUCCESS", "progress": "100%" }
+    },
+    {
+      "name": "omni operation error fails instead of waiting forever",
+      "hook": "parseTaskResult",
+      "args": [{}, { "name": "operations/op_abc", "done": true, "error": { "code": 400, "message": "filtered" } }],
+      "expected": { "status": "FAILURE", "progress": "100%", "reason": "filtered" }
+    },
+    {
+      "name": "omni completed operation without a URI fails",
+      "hook": "parseTaskResult",
+      "args": [{}, { "name": "operations/op_abc", "done": true, "response": { "generateVideoResponse": { "generatedSamples": [] } } }],
+      "expected": { "status": "FAILURE", "progress": "100%", "reason": "operation completed without a video URI" }
+    },
+    {
+      "name": "omni lists the operation URI as a video artifact",
+      "hook": "listArtifacts",
+      "args": [
+        {
+          "status": "SUCCESS",
+          "data": {
+            "name": "operations/op_abc",
+            "done": true,
+            "response": {
+              "generateVideoResponse": {
+                "generatedSamples": [{ "video": { "uri": "https://backend.example.invalid/video.mp4" } }]
+              }
+            }
+          }
+        }
+      ],
+      "expected": [{ "key": "video", "type": "video", "mimeType": "video/mp4" }]
+    },
+    {
+      "name": "omni downloads URI bytes without an inline contentPath or a model context",
+      "hook": "buildContentRequest",
+      "args": [
+        {
+          "taskId": "task_public",
+          "baseUrl": "https://backend.example.invalid",
+          "apiKey": "test-key",
+          "artifactKey": "video",
+          "state": { "video_api": "predict_long_running", "video_api_key_location": "query" },
+          "data": {
+            "name": "operations/op_abc",
+            "done": true,
+            "response": {
+              "generateVideoResponse": {
+                "generatedSamples": [{ "video": { "uri": "https://backend.example.invalid/video.mp4?alt=media" } }]
+              }
+            }
+          },
+          "clientRequest": { "method": "HEAD", "headers": {} }
+        }
+      ],
+      "expected": { "url": "https://backend.example.invalid/video.mp4?alt=media&key=test-key", "method": "HEAD", "headers": {} }
+    },
+    {
+      "name": "omni does not send the channel key to a cross-origin CDN",
+      "hook": "buildContentRequest",
+      "args": [
+        {
+          "baseUrl": "https://backend.example.invalid",
+          "apiKey": "test-key",
+          "artifactKey": "video",
+          "state": { "video_api": "predict_long_running", "video_api_key_location": "query" },
+          "data": {
+            "name": "operations/op_abc",
+            "done": true,
+            "response": {
+              "generateVideoResponse": {
+                "generatedSamples": [{ "video": { "uri": "https://cdn.example.invalid/video.mp4?sig=a%2Fb" } }]
+              }
+            }
+          },
+          "clientRequest": { "method": "GET", "headers": {} }
+        }
+      ],
+      "expected": { "url": "https://cdn.example.invalid/video.mp4?sig=a%2Fb", "method": "GET", "credentialless": true }
+    },
+    {
+      "name": "omni operation without token usage retains its reservation",
+      "hook": "extractUsageOnComplete",
+      "args": [{ "model": "gemini-omni-1.2-flash" }, {}, { "name": "operations/op_abc", "done": true }],
+      "expected": null
     }
   ]
 }
